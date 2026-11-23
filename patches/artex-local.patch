@@ -1,0 +1,430 @@
+diff --git a/agent/chat.go b/agent/chat.go
+index 7d20b90..2f5ccab 100644
+--- a/agent/chat.go
++++ b/agent/chat.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/Autumn-27/artex/guard"
+ 	"github.com/Autumn-27/artex/intercept"
+ 	"github.com/Autumn-27/norma/agentcore"
++	"github.com/Autumn-27/norma/harness"
+ 	"github.com/Autumn-27/norma/llm"
+ 	"github.com/Autumn-27/norma/permission"
+ 	actool "github.com/Autumn-27/norma/tool"
+@@ -74,13 +75,23 @@ func (c *ChatAgent) SetWebSearch(o WebSearchOpts) { c.webSearch = o }
+ // agent. Must be called before Chat; safe to call multiple times.
+ func (c *ChatAgent) SetGuard(g *guard.Guard) { c.guard = g }
+ 
+-// chatWorkDirSpec returns a working-directory notice appended to every chat
+-// agent's system prompt. Mirrors artifactSpec but without pentest-specific
+-// wording ("payload", "capture response bodies") that would be odd in a general assistant.
++// chatWorkDirSpec gives chat agents a default location for generated files while
++// preserving operator-selected paths for direct VM work.
+ func chatWorkDirSpec(workDir string) string {
+-	return "\n\n**File output rules**: whenever you need to write a file, write it to the working directory " + workDir + " (this is the default CWD — relative paths land here, and you may also use this absolute path) — do not write to /tmp or other absolute paths."
++	return "\n\n**Working directory**: relative file paths use " + workDir + " by default. When the operator specifies a different path for a VM task, use that path."
+ }
+ 
++// autoExecutionGuidance is code-owned so a stale or edited database prompt cannot
++// reduce Auto to a platform help bot. Auto has the same VM tools as other chat
++// agents and should try them before declaring a requested operation impossible.
++const autoExecutionGuidance = `
++
++Auto operator execution:
++- Treat a clear operator request concerning this Debian VM as work to perform now. Use Bash, Read, Write, Edit, or the relevant ARTEX task tool in this turn; do not answer with a generic inability statement or moral commentary in place of a tool attempt.
++- You may work directly in the VM, including an operator-specified path. For a longer assessment, start or steer an ARTEX task when that is the appropriate tool.
++- If one tool or command fails, inspect the concrete error and try a reasonable alternative within the operator's stated scope. Report an actual missing credential, denied platform action, or exhausted technical path precisely.
++- Keep targets and data within the operator's authorized scope. Never claim an action succeeded without its tool result.`
++
+ // chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
+ // no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
+ // Every chat agent, built-in or custom, can read target-derived content through
+@@ -89,6 +100,9 @@ func chatWorkDirSpec(workDir string) string {
+ func chatSystem(agentKey, dataDir, workDir string) string {
+ 	body := renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()})
+ 	body += untrustedContentTail(body)
++	if agentKey == "auto" {
++		body += autoExecutionGuidance
++	}
+ 	return body + chatWorkDirSpec(workDir) + noiseProfileBlock()
+ }
+ 
+@@ -194,11 +208,46 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
+ 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
+ 	// revealed tools stay callable across the fresh session.
+ 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
+-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
++	forward := func(r db.Activity) {
+ 		if emit != nil {
+ 			r.Worker = agentKey
+ 			emit(r)
+ 		}
++	}
++	if agentKey != "auto" {
++		text, _, err := captureRunSession(ctx, s, message, forward)
++		return text, err
++	}
++	// Auto's first model reply can be a plan or refusal despite an actionable
++	// request. Hold that text until we know whether the model actually used a tool.
++	// If it did not, continue the same session once with an explicit execution
++	// instruction. Never claim a tool ran if both attempts ended in prose.
++	var first []db.Activity
++	usedTool := false
++	text, reason, err := captureRunSession(ctx, s, message, func(r db.Activity) {
++		if r.Kind == "tool_use" {
++			usedTool = true
++			for _, pending := range first {
++				forward(pending)
++			}
++			first = nil
++		}
++		if usedTool {
++			forward(r)
++		} else {
++			first = append(first, r)
++		}
+ 	})
+-	return text, err
++	if usedTool || err != nil || reason != harness.ReasonCompleted || ctx.Err() != nil {
++		for _, r := range first {
++			forward(r)
++		}
++		return text, err
++	}
++	returnText, _, retryErr := captureRunSession(ctx, s,
++		"Sua resposta anterior apenas descreveu ou recusou a tarefa, sem chamar nenhuma ferramenta. "+
++			"Se o pedido do operador requer uma ação, execute agora a primeira ação concreta usando uma ferramenta disponível "+
++			"(Bash/Read/Write/Edit ou a ferramenta de missão adequada), acompanhe o resultado e continue a tarefa. "+
++			"Não entregue outro plano no lugar da execução. Se uma ação não puder ser feita, explique o bloqueio concreto.", forward)
++	return returnText, retryErr
+ }
+diff --git a/agent/promptcatalog.go b/agent/promptcatalog.go
+index 5b54bf9..b522699 100644
+--- a/agent/promptcatalog.go
++++ b/agent/promptcatalog.go
+@@ -15,11 +15,12 @@ package agent
+ // (spawn/list/pause/hint + read graph/findings/traces) and platform management
+ // (create/modify skill, custom tool, MCP). It seeds into agent_prompts like the
+ // other built-ins.
+-const autoDefaultTmpl = `You are **Auto**, the "operations assistant" of this penetration testing platform. You do not pentest yourself; instead you **operate the platform through tools** and get things done per the user's instructions.
++const autoDefaultTmpl = `You are **Auto**, the operator's assistant in this Debian VM. Carry out the user's requests with your VM tools and operate the penetration testing platform through its task tools when appropriate.
+ 
+ What you can do (depends on which tools are enabled for you):
+ 1. **Task operations**: list_tasks for the global view, spawn_task to start a subtask, get_task_graph / list_task_findings to read a task's progress and findings (including flags), get_task_worker_trace to see a work's execution process, pause_task to pause, add_task_hint to inject a hint into a task.
+ 2. **Platform management**: create_skill / update_skill to create/modify skills; create_custom_tool / update_custom_tool to create/modify custom tools (command/script/http); create_mcp / update_mcp to create/modify MCP servers.
++3. **Direct VM work**: Bash / Read / Write / Edit to inspect, configure, build, and test software in the VM, including paths explicitly supplied by the operator.
+ 
+ Principles:
+ - Check the current state first (list_tasks / get_task_graph etc.) before acting; get it done in one pass, no idle spinning.
+diff --git a/llmpool/health.go b/llmpool/health.go
+index 58e21e1..adfa081 100644
+--- a/llmpool/health.go
++++ b/llmpool/health.go
+@@ -117,8 +117,8 @@ func (r *Registry) Get(id int64) State {
+ // IsOpen reports whether a profile is in its cooling-off window.
+ func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
+ 
+-// Pass records a successful call: clears the failure counters so a profile that
+-// recovers is fully trusted again (and drops the persisted row).
++// Pass records a successful call. It clears failure counters once the cooling
++// window has expired; an in-flight success cannot end an active cooldown.
+ func (r *Registry) Pass(id int64) {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+@@ -126,6 +126,12 @@ func (r *Registry) Pass(id int64) {
+ 	if st == nil || (st.Fails == 0 && st.Trips == 0 && st.OpenUntil.IsZero()) {
+ 		return // already clean; nothing to write
+ 	}
++	// A request already in flight can succeed after another request received
++	// 429 and opened the breaker. Keep the cooling window in that case; the
++	// success does not prove the provider will accept new requests yet.
++	if st.Open() {
++		return
++	}
+ 	delete(r.m, id)
+ 	if r.forget != nil {
+ 		r.forget(id)
+diff --git a/llmpool/health_order_test.go b/llmpool/health_order_test.go
+index 5767224..8aba28c 100644
+--- a/llmpool/health_order_test.go
++++ b/llmpool/health_order_test.go
+@@ -23,7 +23,7 @@ func TestHealthCallbacksStayInStateOrder(t *testing.T) {
+ 		func(int64, State) { block() },
+ 		func(int64) { block() },
+ 	)
+-	go reg.Trip(1, "down", true)
++	go reg.Trip(1, "down", false) // below the trip threshold, so Pass may clear it
+ 	select {
+ 	case <-firstIn:
+ 	case <-time.After(2 * time.Second):
+diff --git a/llmpool/health_policy_test.go b/llmpool/health_policy_test.go
+index 09783c0..a77a827 100644
+--- a/llmpool/health_policy_test.go
++++ b/llmpool/health_policy_test.go
+@@ -65,3 +65,20 @@ func TestZeroPolicyKeepsDefaults(t *testing.T) {
+ 		t.Fatalf("cooldown=%v, want the first ladder rung (~1min)", d)
+ 	}
+ }
++
++func TestInFlightSuccessDoesNotClearCooldown(t *testing.T) {
++	reg := NewRegistry(nil, nil)
++	reg.SetPolicy(1, 5*time.Minute)
++	if !reg.Trip(1, "status 429", false) {
++		t.Fatal("429 should open the breaker")
++	}
++	reg.Pass(1) // a successful request that started before the 429
++	if !reg.IsOpen(1) {
++		t.Fatal("in-flight success cleared the active cooldown")
++	}
++	reg.Restore(1, State{Trips: 1, OpenUntil: time.Now().Add(-time.Second)})
++	reg.Pass(1)
++	if st := reg.Get(1); st.Trips != 0 || !st.OpenUntil.IsZero() {
++		t.Fatalf("expired cooldown was not cleared: %+v", st)
++	}
++}
+diff --git a/llmpool/pool.go b/llmpool/pool.go
+index 39840f4..5496fd6 100644
+--- a/llmpool/pool.go
++++ b/llmpool/pool.go
+@@ -10,6 +10,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync/atomic"
++	"time"
+ 	"unicode/utf8"
+ 
+ 	"github.com/Autumn-27/norma/llm"
+@@ -81,10 +82,17 @@ func (p *Pool) Head() *Member { return p.members[0] }
+ // credit, 401 bad key, 429, 5xx) all surface during request establishment,
+ // before the body is read, so they always land in the safe window.
+ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+-	order := p.order(req)
+ 	return func(yield func(llm.StreamEvent, error) bool) {
++		order, err := p.waitOrder(ctx, req)
++		if err != nil {
++			yield(llm.StreamEvent{}, err)
++			return
++		}
+ 		var lastErr error
+ 		for i, m := range order {
++			if p.health.IsOpen(m.ID) {
++				continue
++			}
+ 			emitted := false
+ 			var failed error
+ 			for ev, err := range m.Prov.Stream(ctx, req) {
+@@ -128,9 +136,15 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
+ // tried without risk of duplicated output. Mirrors Stream's health-tripping and
+ // chain-exhaustion behavior.
+ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+-	order := p.order(req)
++	order, err := p.waitOrder(ctx, req)
++	if err != nil {
++		return llm.Message{}, "", llm.Usage{}, err
++	}
+ 	var lastErr error
+ 	for i, m := range order {
++		if p.health.IsOpen(m.ID) {
++			continue
++		}
+ 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
+ 		if err == nil {
+ 			p.health.RecordCall(ctx, m.ID, false, false, nil) // Pass
+@@ -162,27 +176,63 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
+ 
+ // order picks the members to try, in order: skip those in a cooling-off window
+ // and those whose context window can't hold this request, then rotate within each
+-// equal-priority group so same-priority profiles share the load. Never returns an
+-// empty slice — if everything is filtered out, the head of the chain is tried
+-// anyway, since stalling the engine is worse than one more failed request.
++// equal-priority group so same-priority profiles share the load. Returns nil
++// while every member is cooling off, so callers can wait instead of repeatedly
++// probing a key that just received HTTP 429.
+ func (p *Pool) order(req llm.CompletionRequest) []*Member {
+ 	est := estimateTokens(req)
+ 	var open []*Member
++	allCooling := true
+ 	for _, m := range p.members {
+ 		if p.health.IsOpen(m.ID) {
+ 			continue
+ 		}
++		allCooling = false
+ 		if m.WindowTokens > 0 && est > m.WindowTokens {
+ 			continue // would 400 on length — not a useful failover target
+ 		}
+ 		open = append(open, m)
+ 	}
+ 	if len(open) == 0 {
+-		return p.members[:1] // last resort: probe the head rather than stall
++		if allCooling {
++			return nil
++		}
++		return p.members[:1] // context-window fallback, preserving prior behavior
+ 	}
+ 	return rotateGroups(open, p.rr.Add(1)-1)
+ }
+ 
++// waitOrder respects the shared breaker state. The run's context bounds the
++// wait, including the configured per-agent wall-clock limit.
++func (p *Pool) waitOrder(ctx context.Context, req llm.CompletionRequest) ([]*Member, error) {
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		if order := p.order(req); len(order) > 0 {
++			return order, nil
++		}
++		var until time.Time
++		for _, m := range p.members {
++			openUntil := p.health.Get(m.ID).OpenUntil
++			if until.IsZero() || openUntil.Before(until) {
++				until = openUntil
++			}
++		}
++		delay := time.Until(until)
++		if delay <= 0 {
++			continue
++		}
++		timer := time.NewTimer(delay)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return nil, ctx.Err()
++		case <-timer.C:
++		}
++	}
++}
++
+ // rotateGroups rotates each run of equal-ranked members by n, so profiles sharing
+ // a priority take turns going first (free load-spreading across duplicate keys).
+ // The chain head has its own Rank and always stays at the front.
+diff --git a/llmpool/pool_test.go b/llmpool/pool_test.go
+index 23cbef9..3146a7f 100644
+--- a/llmpool/pool_test.go
++++ b/llmpool/pool_test.go
+@@ -287,20 +287,37 @@ func TestSkipsMembersTooSmallForRequest(t *testing.T) {
+ 	}
+ }
+ 
+-// Everything tripped: probing the head beats stalling the engine outright.
+-func TestAllTrippedStillProbesHead(t *testing.T) {
++// When all profiles are cooling down, a cancelled run must not probe either key.
++func TestAllTrippedWaitsForCooldownOrCancellation(t *testing.T) {
+ 	a, b := okProv("a", "a"), okProv("b", "b")
+ 	reg := NewRegistry(nil, nil)
+ 	reg.Trip(1, "402", true)
+ 	reg.Trip(2, "402", true)
+ 	p := New([]*Member{member(1, "a", 10, a), member(2, "b", 5, b)}, reg)
+ 
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer cancel()
++	_, err := drain(p.Stream(ctx, llm.CompletionRequest{}))
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("err=%v, want deadline exceeded", err)
++	}
++	if a.calls != 0 || b.calls != 0 {
++		t.Fatalf("cooling profiles were probed: a=%d b=%d", a.calls, b.calls)
++	}
++}
++
++func TestAllTrippedResumesAfterCooldown(t *testing.T) {
++	a := okProv("a", "ready")
++	reg := NewRegistry(nil, nil)
++	reg.Restore(1, State{Trips: 1, OpenUntil: time.Now().Add(20 * time.Millisecond)})
++	p := New([]*Member{member(1, "a", 10, a)}, reg)
++	start := time.Now()
+ 	got, err := drain(p.Stream(context.Background(), llm.CompletionRequest{}))
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
++	if err != nil || got != "ready" || a.calls != 1 {
++		t.Fatalf("got=%q err=%v calls=%d, want one call after cooldown", got, err, a.calls)
+ 	}
+-	if got != "a" || a.calls != 1 {
+-		t.Fatalf("text=%q a.calls=%d — want the head probed as a last resort", got, a.calls)
++	if time.Since(start) < 15*time.Millisecond {
++		t.Fatal("profile was probed before cooldown elapsed")
+ 	}
+ }
+ 
+diff --git a/mnt/sherlock-ssd/chatbot-local/ARTEX-baarai-source/agent/auto_execution_test.go b/mnt/sherlock-ssd/chatbot-local/ARTEX-baarai-source/agent/auto_execution_test.go
+new file mode 100644
+index 0000000..9e737e2
+--- /dev/null
++++ b/mnt/sherlock-ssd/chatbot-local/ARTEX-baarai-source/agent/auto_execution_test.go
+@@ -0,0 +1,77 @@
++package agent
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/Autumn-27/artex/db"
++	"github.com/Autumn-27/norma/llm"
++)
++
++func TestAutoExecutionGuidanceSurvivesDatabasePrompt(t *testing.T) {
++	previous := PromptOverride()
++	t.Cleanup(func() { SetPromptOverride(previous) })
++	SetPromptOverride(func(key string) (string, bool) {
++		if key == "auto" {
++			return "You are an assistant.", true
++		}
++		return "", false
++	})
++
++	auto := chatSystem("auto", "/data", "/work")
++	if !strings.Contains(auto, "Use Bash, Read, Write, Edit") {
++		t.Fatal("Auto lost its direct VM execution guidance")
++	}
++	if !strings.Contains(auto, "operator-specified path") {
++		t.Fatal("Auto cannot use paths requested by the operator")
++	}
++	if strings.Contains(chatSystem("pentest", "/data", "/work"), "Auto operator execution:") {
++		t.Fatal("Auto guidance leaked into another chat role")
++	}
++}
++
++func TestAutoRetriesPlanOnlyReplyWithToolExecution(t *testing.T) {
++	calls := 0
++	provider := captureUsageProvider{stream: func(_ context.Context, yield func(llm.StreamEvent, error) bool) {
++		calls++
++		var events []llm.StreamEvent
++		switch calls {
++		case 1:
++			events = []llm.StreamEvent{{Type: llm.SETextDelta, Text: "I would make a plan."}, {Type: llm.SEMessageDelta, StopReason: "end_turn"}}
++		case 2:
++			events = []llm.StreamEvent{{Type: llm.SEToolUseStart, ToolID: "call-1", ToolName: "Bash"}, {Type: llm.SEToolInputJSON, Text: `{"command":"printf action-executed"}`}, {Type: llm.SEMessageDelta, StopReason: "tool_use"}}
++		default:
++			events = []llm.StreamEvent{{Type: llm.SETextDelta, Text: "done"}, {Type: llm.SEMessageDelta, StopReason: "end_turn"}}
++		}
++		for _, event := range events {
++			if !yield(event, nil) {
++				return
++			}
++		}
++	}}
++	c := NewChatAgent(provider, "fixture", t.TempDir(), nil, 0)
++	var activities []db.Activity
++	_, err := c.Chat(t.Context(), "auto", "conv-auto-execute", "Run a command", 5, 0, false, func(a db.Activity) { activities = append(activities, a) })
++	if err != nil {
++		t.Fatal(err)
++	}
++	if calls != 3 {
++		t.Fatalf("provider calls=%d, want plan + tool + completion", calls)
++	}
++	used, result := false, false
++	for _, a := range activities {
++		if strings.Contains(a.Detail, "I would make a plan.") {
++			t.Fatal("plan-only first reply leaked into visible activities")
++		}
++		if a.Kind == "tool_use" && a.Tool == "Bash" {
++			used = true
++		}
++		if a.Kind == "tool_result" && strings.Contains(a.Detail, "action-executed") {
++			result = true
++		}
++	}
++	if !used || !result {
++		t.Fatalf("Auto did not execute Bash: used=%t result=%t", used, result)
++	}
++}

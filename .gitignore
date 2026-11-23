@@ -1,0 +1,9 @@
+.restore-download/
+.restored-private/
+*.qcow2
+*.qcow2.zst.gpg.part-*
+*.iso.part-*
+*.qcow2.zst.gpg.chunk-*
+*.iso.chunk-*
+*.tar.zst.gpg
+chave-de-restauracao.txt

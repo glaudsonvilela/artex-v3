@@ -1,0 +1,85 @@
+<filter name='sherlock-web-egress' chain='root'>
+  <uuid>3b97f930-b166-4c3e-b2bb-b96a5f7d7360</uuid>
+  <rule action='accept' direction='out' priority='-1000'>
+    <arp/>
+  </rule>
+  <rule action='accept' direction='out' priority='-999'>
+    <ip dstipaddr='255.255.255.255' protocol='udp' srcportstart='68' srcportend='68' dstportstart='67' dstportend='67'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-998'>
+    <ip dstipaddr='172.31.241.1' protocol='udp' srcportstart='68' srcportend='68' dstportstart='67' dstportend='67'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-997'>
+    <ip dstipaddr='172.31.241.1' protocol='udp' dstportstart='53' dstportend='53'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-996'>
+    <ip dstipaddr='172.31.241.1' protocol='tcp' dstportstart='53' dstportend='53'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-995'>
+    <ip dstipaddr='172.31.241.1' protocol='tcp' dstportstart='18888' dstportend='18888'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-994'>
+    <ip dstipaddr='172.31.241.1' protocol='tcp' srcportstart='22' srcportend='22'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-950'>
+    <ip dstipaddr='0.0.0.0' dstipmask='8'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-949'>
+    <ip dstipaddr='10.0.0.0' dstipmask='8'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-948'>
+    <ip dstipaddr='100.64.0.0' dstipmask='10'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-947'>
+    <ip dstipaddr='127.0.0.0' dstipmask='8'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-946'>
+    <ip dstipaddr='169.254.0.0' dstipmask='16'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-945'>
+    <ip dstipaddr='172.16.0.0' dstipmask='12'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-944'>
+    <ip dstipaddr='192.0.0.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-943'>
+    <ip dstipaddr='192.0.2.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-942'>
+    <ip dstipaddr='192.168.0.0' dstipmask='16'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-941'>
+    <ip dstipaddr='198.18.0.0' dstipmask='15'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-940'>
+    <ip dstipaddr='198.51.100.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-939'>
+    <ip dstipaddr='203.0.113.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-938'>
+    <ip dstipaddr='224.0.0.0' dstipmask='4'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-937'>
+    <ip dstipaddr='240.0.0.0' dstipmask='4'/>
+  </rule>
+  <rule action='drop' direction='out' priority='-700'>
+    <ipv6/>
+  </rule>
+  <rule action='accept' direction='out' priority='-100'>
+    <ip protocol='tcp' dstportstart='80' dstportend='80'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-99'>
+    <ip protocol='tcp' dstportstart='443' dstportend='443'/>
+  </rule>
+  <rule action='accept' direction='out' priority='-98'>
+    <ip protocol='udp' dstportstart='443' dstportend='443'/>
+  </rule>
+  <rule action='drop' direction='out' priority='900'>
+    <ip/>
+  </rule>
+  <rule action='drop' direction='out' priority='901'>
+    <mac/>
+  </rule>
+</filter>
+
