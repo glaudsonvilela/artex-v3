@@ -12,6 +12,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
@@ -466,7 +468,48 @@ type quotaAwareTransport struct {
 	userAgent string
 }
 
+// requiredToolChoice is scoped to Auto's recovery turn. It stays active across
+// transient HTTP retries and is cleared as soon as the model starts a tool call.
+type requiredToolChoice struct {
+	active    atomic.Bool
+	attempted atomic.Bool
+}
+
+type requiredToolChoiceKey struct{}
+
+func withRequiredToolChoice(ctx context.Context) (context.Context, *requiredToolChoice) {
+	state := &requiredToolChoice{}
+	state.active.Store(true)
+	return context.WithValue(ctx, requiredToolChoiceKey{}, state), state
+}
+
+func addRequiredToolChoice(req *http.Request) (*http.Request, bool) {
+	state, _ := req.Context().Value(requiredToolChoiceKey{}).(*requiredToolChoice)
+	if state == nil || !state.active.Load() || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		return req, false
+	}
+	raw := requestBodySnapshot(req)
+	var body map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &body) != nil || len(body["tools"]) == 0 ||
+		bytes.Equal(bytes.TrimSpace(body["tools"]), []byte("null")) ||
+		bytes.Equal(bytes.TrimSpace(body["tools"]), []byte("[]")) {
+		return req, false
+	}
+	body["tool_choice"] = json.RawMessage(`"required"`)
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return req, false
+	}
+	req = req.Clone(req.Context())
+	req.Body = io.NopCloser(bytes.NewReader(encoded))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(encoded)), nil }
+	req.ContentLength = int64(len(encoded))
+	state.attempted.Store(true)
+	return req, true
+}
+
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req, _ = addRequiredToolChoice(req)
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
 	// Stable across a session's turns and distinct across sessions — exactly what

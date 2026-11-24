@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -244,10 +245,36 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		}
 		return text, err
 	}
-	returnText, _, retryErr := captureRunSession(ctx, s,
+	retryCtx, requiredTool := withRequiredToolChoice(ctx)
+	retryUsedTool := false
+	var retryPending []db.Activity
+	returnText, _, retryErr := captureRunSession(retryCtx, s,
 		"Sua resposta anterior apenas descreveu ou recusou a tarefa, sem chamar nenhuma ferramenta. "+
 			"Se o pedido do operador requer uma ação, execute agora a primeira ação concreta usando uma ferramenta disponível "+
 			"(Bash/Read/Write/Edit ou a ferramenta de missão adequada), acompanhe o resultado e continue a tarefa. "+
-			"Não entregue outro plano no lugar da execução. Se uma ação não puder ser feita, explique o bloqueio concreto.", forward)
-	return returnText, retryErr
+			"Não entregue outro plano no lugar da execução. Se uma ação não puder ser feita, explique o bloqueio concreto.", func(r db.Activity) {
+			if r.Kind == "tool_use" {
+				requiredTool.active.Store(false)
+				retryUsedTool = true
+				for _, pending := range retryPending {
+					forward(pending)
+				}
+				retryPending = nil
+			}
+			if retryUsedTool {
+				forward(r)
+			} else {
+				retryPending = append(retryPending, r)
+			}
+		})
+	if retryUsedTool {
+		return returnText, retryErr
+	}
+	if retryErr != nil || !requiredTool.attempted.Load() {
+		for _, pending := range retryPending {
+			forward(pending)
+		}
+		return returnText, retryErr
+	}
+	return "", errors.New("o modelo respondeu sem executar uma ferramenta; nenhuma ação foi realizada nesta tentativa")
 }

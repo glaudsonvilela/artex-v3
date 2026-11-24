@@ -33,8 +33,23 @@ func TestAutoExecutionGuidanceSurvivesDatabasePrompt(t *testing.T) {
 
 func TestAutoRetriesPlanOnlyReplyWithToolExecution(t *testing.T) {
 	calls := 0
-	provider := captureUsageProvider{stream: func(_ context.Context, yield func(llm.StreamEvent, error) bool) {
+	provider := captureUsageProvider{stream: func(ctx context.Context, yield func(llm.StreamEvent, error) bool) {
 		calls++
+		state, _ := ctx.Value(requiredToolChoiceKey{}).(*requiredToolChoice)
+		switch calls {
+		case 1:
+			if state != nil {
+				t.Fatal("first attempt unexpectedly required a tool")
+			}
+		case 2:
+			if state == nil || !state.active.Load() {
+				t.Fatal("recovery attempt did not require a tool")
+			}
+		case 3:
+			if state == nil || state.active.Load() {
+				t.Fatal("tool choice remained required after the first tool call")
+			}
+		}
 		var events []llm.StreamEvent
 		switch calls {
 		case 1:
